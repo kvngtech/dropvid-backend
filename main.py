@@ -1,14 +1,20 @@
 import os
-import glob
-import shutil
-import tempfile
+import re
+import time
+import secrets
 import asyncio
+import subprocess
+import tempfile
+import threading
+import urllib.error
+import urllib.request
 from typing import List
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 import yt_dlp
 import imageio_ffmpeg
 
@@ -85,6 +91,23 @@ def base_ydl_opts() -> dict:
     return opts
 
 
+# ──────────────────────────────────────────────────────────────
+# Limits. Render's free instance has ~512MB RAM, so we cap how many
+# yt-dlp lookups / ffmpeg processes can run at the same time.
+# ──────────────────────────────────────────────────────────────
+CHUNK = 128 * 1024
+EXTRACT_SLOTS = threading.BoundedSemaphore(4)
+FFMPEG_SLOTS = threading.BoundedSemaphore(3)
+
+# Short-lived "download tickets". /prepare resolves the stream once and
+# hands the browser a token; the browser then downloads /file/<token>
+# natively. In-memory is fine because the app runs as a single process
+# (see Procfile). If you ever run several workers, move this to Redis.
+PLAN_TTL = 15 * 60
+PLANS: dict = {}
+PLANS_LOCK = threading.Lock()
+
+
 class URLRequest(BaseModel):
     urls: List[str]
 
@@ -159,61 +182,299 @@ def get_video_info(url: str):
         }
 
 
+def get_video_info_limited(url: str):
+    with EXTRACT_SLOTS:
+        return get_video_info(url)
+
+
+# ──────────────────────────────────────────────────────────────
+# Resolving what to download (no bytes are downloaded here)
+# ──────────────────────────────────────────────────────────────
+def validate_quality(quality: str) -> str:
+    if quality in ("worst", "audio") or (quality.isdigit() and 100 <= int(quality) <= 4320):
+        return quality
+    raise HTTPException(status_code=400, detail="Unknown quality option")
+
+
 def build_format_string(quality: str) -> str:
     if quality == "audio":
         return "bestaudio/best"
     if quality == "worst":
-        return "worst"
-    return f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        # Smallest single file that already has video + audio together.
+        return "worst[vcodec!=none][acodec!=none]/worst"
+    return f"bv*[height<={quality}]+ba/b[height<={quality}]/b"
 
 
-def download_to_temp(url: str, quality: str):
-    """
-    Actually downloads (and, for video, merges) the file server-side using
-    yt-dlp + a bundled ffmpeg binary, so we can hand back a real playable
-    file instead of a bare CDN URL that the browser can't use directly.
-    Returns (filepath, tmpdir) — caller is responsible for cleaning tmpdir.
-    """
-    tmpdir = tempfile.mkdtemp(prefix="dropvid_")
-    outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+def clean_headers(headers) -> dict:
+    out = dict(headers or {})
+    for key in list(out):
+        if key.lower() in ("accept-encoding", "host", "content-length", "range"):
+            del out[key]
+    return out
 
-    ydl_opts = {
+
+MIME_BY_EXT = {
+    "mp4": "video/mp4",
+    "webm": "video/webm",
+    "mov": "video/quicktime",
+    "m4a": "audio/mp4",
+    "mp3": "audio/mpeg",
+}
+
+
+def resolve_plan(url: str, quality: str) -> dict:
+    opts = {
         **base_ydl_opts(),
-        "outtmpl": outtmpl,
-        "ffmpeg_location": FFMPEG_PATH,
+        "skip_download": True,
+        "noplaylist": True,
         "format": build_format_string(quality),
     }
+    if quality not in ("audio", "worst"):
+        # Highest resolution under the cap, preferring mp4/m4a so the
+        # streams can be joined without re-encoding.
+        opts["format_sort"] = ["res", "ext:mp4:m4a"]
+
+    with EXTRACT_SLOTS:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+    if info and info.get("entries"):
+        first = next(iter(info["entries"]), None)
+        if first:
+            info = first
+    if not info:
+        raise RuntimeError("Could not read this video")
+
+    chosen = info.get("requested_formats") or [info]
+    sources = []
+    for f in chosen:
+        if not f.get("url"):
+            raise RuntimeError("No downloadable stream found for this video")
+        sources.append({
+            "url": f["url"],
+            "headers": clean_headers(f.get("http_headers") or info.get("http_headers")),
+            "protocol": f.get("protocol") or "",
+            "acodec": f.get("acodec") or "",
+            "ext": f.get("ext") or "",
+            "size": f.get("filesize") or f.get("filesize_approx") or 0,
+        })
+
+    title = re.sub(r"[^\w\- ]+", "", info.get("title") or "video", flags=re.ASCII).strip()
+    title = re.sub(r"\s+", "_", title)[:60] or "video"
 
     if quality == "audio":
-        ydl_opts["postprocessors"] = [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }]
+        mode, ext, inputs = "mp3", "mp3", [sources[0]]
+    elif len(sources) == 1 and sources[0]["protocol"] in ("http", "https"):
+        # One ready-made file on a normal web server: just pass it through.
+        mode, ext, inputs = "direct", (sources[0]["ext"] or "mp4"), sources
     else:
-        ydl_opts["merge_output_format"] = "mp4"
+        # Separate video+audio (or an HLS/DASH stream): join on the fly.
+        mode, ext, inputs = "mux", "mp4", sources
+
+    return {
+        "mode": mode,
+        "inputs": inputs,
+        "ext": ext,
+        "mime": MIME_BY_EXT.get(ext, "application/octet-stream"),
+        "filename": f"dropvid_{title}.{ext}",
+        "size": sources[0]["size"] if mode == "direct" else None,
+    }
+
+
+def probe_direct(src: dict):
+    """Cheap check that the source server will actually serve the file, so
+    problems show up on the page instead of as a silent failed download."""
+    req = urllib.request.Request(src["url"], headers={**src["headers"], "Range": "bytes=0-0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read(1)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"The source server refused the download (HTTP {e.code}). Try another quality.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach the source server: {e}")
+
+
+def make_plan(url: str, quality: str) -> dict:
+    quality = validate_quality(quality)
+    try:
+        plan = resolve_plan(url.strip(), quality)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if plan["mode"] == "direct":
+        probe_direct(plan["inputs"][0])
+    return plan
+
+
+def store_plan(plan: dict) -> str:
+    token = secrets.token_urlsafe(16)
+    now = time.time()
+    with PLANS_LOCK:
+        for old in [t for t, (ts, _) in PLANS.items() if now - ts > PLAN_TTL]:
+            del PLANS[old]
+        PLANS[token] = (now, plan)
+    return token
+
+
+def get_plan(token: str):
+    with PLANS_LOCK:
+        item = PLANS.get(token)
+    if not item or time.time() - item[0] > PLAN_TTL:
+        return None
+    return item[1]
+
+
+# ──────────────────────────────────────────────────────────────
+# Streaming the bytes to the browser
+# ──────────────────────────────────────────────────────────────
+class ByteStream:
+    """Iterable of byte chunks that always cleans up after itself, even if
+    the client disconnects before the first chunk is read."""
+
+    def __init__(self, read_chunk, on_close, first: bytes = b""):
+        self._read_chunk = read_chunk
+        self._on_close = on_close
+        self._first = first
+        self._closed = False
+        self._lock = threading.Lock()
+        self.length = None
+
+    def __iter__(self):
+        try:
+            if self._first:
+                yield self._first
+            while True:
+                chunk = self._read_chunk()
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self._on_close()
+        except Exception:
+            pass
+
+
+def build_ffmpeg_cmd(plan: dict) -> list:
+    cmd = [FFMPEG_PATH, "-hide_banner", "-loglevel", "error", "-nostdin"]
+    for src in plan["inputs"]:
+        header_block = "".join(f"{k}: {v}\r\n" for k, v in src["headers"].items())
+        if header_block:
+            cmd += ["-headers", header_block]
+        cmd += ["-i", src["url"]]
+
+    if plan["mode"] == "mp3":
+        return cmd + ["-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-f", "mp3", "pipe:1"]
+
+    inputs = plan["inputs"]
+    if len(inputs) == 2:
+        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+        audio_src = inputs[1]
+    else:
+        cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
+        audio_src = inputs[0]
+
+    cmd += ["-c:v", "copy"]
+    if audio_src["acodec"].startswith(("mp4a", "aac")):
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+
+    # Fragmented MP4 can be written to a pipe, so the download starts
+    # immediately instead of waiting for the whole file to be built.
+    cmd += ["-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", "pipe:1"]
+    return cmd
+
+
+def open_direct(src: dict) -> ByteStream:
+    req = urllib.request.Request(src["url"], headers=src["headers"])
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"The source server refused the download (HTTP {e.code}). Please try again.")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach the source server: {e}")
+    stream = ByteStream(lambda: resp.read(CHUNK), resp.close)
+    stream.length = resp.headers.get("Content-Length")
+    return stream
+
+
+def open_ffmpeg(plan: dict) -> ByteStream:
+    if not FFMPEG_SLOTS.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="The server is busy right now. Please try again in a few seconds.")
+
+    errlog = tempfile.TemporaryFile()
+    proc = None
+
+    def release():
+        try:
+            if proc is not None:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=5)
+        except Exception:
+            pass
+        try:
+            errlog.close()
+        except Exception:
+            pass
+        FFMPEG_SLOTS.release()
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
-    except Exception:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise
+        proc = subprocess.Popen(
+            build_ffmpeg_cmd(plan),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=errlog,
+            bufsize=0,
+        )
+        first = proc.stdout.read(CHUNK)
+    except Exception as e:
+        release()
+        raise HTTPException(status_code=500, detail=f"Could not start the converter: {e}")
 
-    # Postprocessing can rename the file (e.g. .webm -> .mp3), so find
-    # whatever actually landed in the temp dir rather than guessing the name.
-    produced = glob.glob(os.path.join(tmpdir, "*"))
-    if not produced:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        raise RuntimeError("Download finished but no output file was found")
+    if not first:
+        errlog.seek(0)
+        tail = errlog.read()[-400:].decode("utf-8", "replace").strip()
+        release()
+        print(f"[ffmpeg] produced no output: {tail}", flush=True)
+        raise HTTPException(status_code=502, detail="Could not read this video's stream. Try another quality.")
 
-    return produced[0], tmpdir
-
-
-def cleanup_tmpdir(path: str):
-    shutil.rmtree(path, ignore_errors=True)
+    return ByteStream(lambda: proc.stdout.read(CHUNK), release, first=first)
 
 
+def open_stream(plan: dict) -> StreamingResponse:
+    headers = {
+        "Content-Disposition": f'attachment; filename="{plan["filename"]}"',
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+    }
+    if plan["mode"] == "direct":
+        stream = open_direct(plan["inputs"][0])
+        if stream.length:
+            headers["Content-Length"] = str(stream.length)
+    else:
+        stream = open_ffmpeg(plan)
+
+    return StreamingResponse(
+        iter(stream),
+        media_type=plan["mime"],
+        headers=headers,
+        background=BackgroundTask(stream.close),
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# Routes
+# ──────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {
@@ -227,36 +488,37 @@ async def fetch_info(request: URLRequest):
     if len(request.urls) > 10:
         raise HTTPException(status_code=400, detail="Maximum 10 URLs allowed")
 
-    results = []
-    for url in request.urls:
-        if not url.strip():
-            continue
+    async def one(url: str):
         try:
-            info = await asyncio.to_thread(get_video_info, url.strip())
-            results.append({"url": url, "success": True, **info})
+            info = await asyncio.to_thread(get_video_info_limited, url)
+            return {"url": url, "success": True, **info}
         except Exception as e:
-            results.append({"url": url, "success": False, "error": str(e)})
+            return {"url": url, "success": False, "error": str(e)}
 
-    return {"results": results}
+    urls = [u.strip() for u in request.urls if u.strip()]
+    results = await asyncio.gather(*[one(u) for u in urls])
+    return {"results": list(results)}
+
+
+@app.post("/prepare")
+def prepare_download(request: DownloadRequest):
+    """Step 1: work out what to download and hand back a short-lived ticket."""
+    plan = make_plan(request.url, request.quality)
+    token = store_plan(plan)
+    return {"token": token, "filename": plan["filename"], "size": plan["size"]}
+
+
+@app.get("/file/{token}")
+def download_file(token: str):
+    """Step 2: the browser downloads this URL natively and streams the bytes."""
+    plan = get_plan(token)
+    if not plan:
+        raise HTTPException(status_code=404, detail="This download link expired. Please click Download again.")
+    return open_stream(plan)
 
 
 @app.post("/download")
-async def download_video(request: DownloadRequest, background_tasks: BackgroundTasks):
-    try:
-        filepath, tmpdir = await asyncio.to_thread(
-            download_to_temp, request.url, request.quality
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    background_tasks.add_task(cleanup_tmpdir, tmpdir)
-
-    ext = os.path.splitext(filepath)[1].lstrip(".") or ("mp3" if request.quality == "audio" else "mp4")
-    media_type = "audio/mpeg" if ext == "mp3" else "video/mp4"
-
-    return FileResponse(
-        path=filepath,
-        media_type=media_type,
-        filename=f"dropvid.{ext}",
-        background=background_tasks,
-    )
+def download_video(request: DownloadRequest):
+    """Kept so an older cached copy of the website keeps working."""
+    plan = make_plan(request.url, request.quality)
+    return open_stream(plan)
